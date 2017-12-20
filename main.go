@@ -2,9 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"os"
+	"time"
 )
 
 type TaskInfo struct {
@@ -28,6 +32,22 @@ type TaskInfo struct {
 
 type TaskStatusResponse struct {
 	Tasks []TaskInfo `json:"tasks"`
+}
+
+type ProjectStatusInfo struct {
+	Status string `json:"status"`
+}
+
+type ErrorInfo struct {
+	Message string `json:"msg"`
+}
+
+type ErrorResponse struct {
+	Errors []ErrorInfo `json:"errors"`
+}
+
+type ProjectStatusResponse struct {
+	ProjectStatus ProjectStatusInfo `json:"projectStatus"`
 }
 
 func sonarAPIRequest(
@@ -56,8 +76,36 @@ func sonarAPIRequest(
 	return responseData, err
 }
 
+func apiQualityGatesProjectStatus(sonarHostURL string, projectKey string, token string) (ProjectStatusResponse, error) {
+	var response ProjectStatusResponse
+	var errorsResponse ErrorResponse
+
+	body, err := sonarAPIRequest(
+		sonarHostURL,
+		"api/qualitygates/project_status?projectKey="+projectKey,
+		"GET",
+		token,
+		"")
+
+	if err != nil {
+		return response, err
+	}
+
+	err = json.Unmarshal(body, &errorsResponse)
+	if err != nil || len(errorsResponse.Errors) > 0 {
+		fmt.Println(string(body))
+		return response, errors.New("failed to project status through API and parse response")
+	}
+
+	err = json.Unmarshal(body, &response)
+	if err != nil {
+		return response, err
+	}
+	return response, nil
+}
+
 func apiCeActivityStatus(
-	sonarHostURL string, projectKey string, username string, password string) (TaskStatusResponse, error) {
+	sonarHostURL string, projectKey string, token string) (TaskStatusResponse, error) {
 
 	var response TaskStatusResponse
 
@@ -65,8 +113,8 @@ func apiCeActivityStatus(
 		sonarHostURL,
 		"api/ce/activity?status=PENDING,IN_PROGRESS&component="+projectKey,
 		"GET",
-		username,
-		password)
+		token,
+		"")
 
 	if err != nil {
 		return response, err
@@ -80,11 +128,12 @@ func apiCeActivityStatus(
 	return response, nil
 }
 
-func waitForPendingTasks(sonarHostURL string, projectKey string, username string, password string) bool {
+func waitForPendingTasks(sonarHostURL string, projectKey string, token string, timeout time.Duration, refreshPeriod time.Duration) bool {
+	var workTime time.Duration
 	tasksCount := 1
-	fmt.Println("Waiting for pending tasks to finish...")
-	for tasksCount > 0 {
-		response, err := apiCeActivityStatus(sonarHostURL, projectKey, username, password)
+	fmt.Println("\nWaiting for pending tasks to finish...")
+	for workTime < timeout {
+		response, err := apiCeActivityStatus(sonarHostURL, projectKey, token)
 		if err != nil {
 			fmt.Println("Failed to perform SonarQube API request for activities!")
 			fmt.Println("Error: ", err)
@@ -92,14 +141,55 @@ func waitForPendingTasks(sonarHostURL string, projectKey string, username string
 		}
 		tasksCount = len(response.Tasks)
 		fmt.Printf("\r%d pending tasks remaining for %s component...", tasksCount, projectKey)
+		if tasksCount == 0 {
+			return true
+		}
+		time.Sleep(refreshPeriod)
+		workTime += refreshPeriod
 	}
-	fmt.Println("\n\nNo more pending tasks left for component!\n")
-	return true
+	fmt.Println("\nTimeout reached!")
+	return false
+}
+
+func isQualityGatePassed(sonarHostURL string, projectKey string, token string) bool {
+	projectStatus, err := apiQualityGatesProjectStatus(sonarHostURL, projectKey, token)
+	if err != nil {
+		fmt.Printf("Failed to get project status for projectKey %s\n", projectKey)
+		return false
+	}
+
+	fmt.Println("\n==============================================")
+	fmt.Printf("Project Status: %s\n", projectStatus.ProjectStatus.Status)
+	fmt.Println("==============================================")
+	return projectStatus.ProjectStatus.Status == "OK"
 }
 
 func main() {
-	if waitForPendingTasks("http://localhost:9000/", "externals", "12ec798e45e39d289780709b537cfc92a6f8bfa3", "") {
-		fmt.Println("No pending tasks found!")
+	fmt.Println("Running SonarQube Quality Gate checker!")
+	serverPtr := flag.String("server", "http://localhost:9000/", "Sonar server address to use for API calls")
+	projectKeyPtr := flag.String("project", "", "Sonar project (value from sonar.projectKey for your project) to check state of Quality Gate status")
+	tokenPtr := flag.String("token", "", "User token for SonarQube to execute API requests. User has to have browse permission for the provided project")
+	timeoutPtr := flag.Int64("timeout", 300, "Timeout in seconds to wait for pending tasks to finish execution")
+	refreshPeriodPtr := flag.Int("refresh_period", 1, "Status refresh period")
+	flag.Parse()
 
+	if len(*projectKeyPtr) == 0 || len(*tokenPtr) == 0 {
+		fmt.Println("Project key and token arguments are required!")
+		os.Exit(-1)
+	} else {
+		fmt.Println("Checking if any tasks are running for the provided project...")
+		timeout := time.Duration(*timeoutPtr) * time.Second
+		period := time.Duration(*refreshPeriodPtr) * time.Second
+		if waitForPendingTasks(*serverPtr, *projectKeyPtr, *tokenPtr, timeout, period) {
+			fmt.Printf("\nAll tasks on project %s are finished!\n\n", *projectKeyPtr)
+			fmt.Println("Checking Quality Gate status of the project...")
+			if isQualityGatePassed(*serverPtr, *projectKeyPtr, *tokenPtr) {
+				os.Exit(0)
+			}
+			os.Exit(1)
+		} else {
+			fmt.Printf("\nFailed to wait for project %s run outof tasks!\n\n", *projectKeyPtr)
+			os.Exit(1)
+		}
 	}
 }
